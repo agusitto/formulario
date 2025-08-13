@@ -17,4 +17,4 @@ app.post('/api/form', async (req, res) => {
   }
 });
 
-app.listen(3000, () => console.log('srv en: http://192.168.1.7:3000'));
+app.listen(3000, () => console.log('srv en: http://localhost:3000'));

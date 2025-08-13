@@ -16,7 +16,7 @@ export default {
   },
   methods: {
     async enviar() {
-      const res = await fetch('http://192.168.1.7:3000/api/form', {
+      const res = await fetch('localhost:3000/api/form', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ nombre: this.nombre, email: this.email })
