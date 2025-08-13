@@ -1,6 +1,9 @@
-# Formulario con Vue.js, Node.js y MongoDB
+# Formulario Full Stack con Vue + Node + MongoDB
 
-Aplicación básica de formulario que envía datos desde un frontend en Vue.js a un backend en Node.js con Express y guarda la información en MongoDB.
+![CI Status](https://github.com/agusitto/formulario/actions/workflows/test-app.yml/badge.svg)
+
+Este proyecto incluye un formulario hecho con Vue.js que guarda datos en MongoDB usando un backend con Node.js...
+
 
 ## Tecnologías usadas
 - **Frontend:** Vue.js (Vite)
