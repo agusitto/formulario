@@ -31,11 +31,11 @@ jobs:
 
 
     - name: Install backend dependencies
-      working-directory: backend
+      working-directory: formulario/backend
       run: npm install
 
     - name: Start backend server in background
-      working-directory: backend
+      working-directory: formulario/backend
       run: |
         nohup node server.js > output.log 2>&1 &
         sleep 5
@@ -47,7 +47,7 @@ jobs:
         -d '{"nombre": "Juan", "email": "juan@ejemplo.com"}'
 
     - name: Install frontend dependencies and build
-      working-directory: frontend
+      working-directory: formulario/frontend
       run: |
         npm install
         npm run build
