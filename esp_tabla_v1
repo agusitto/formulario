@@ -1,0 +1,342 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <string.h>
+#include <ctype.h>
+
+/* =======================
+   Configuración general
+   ======================= */
+#define ENABLE_DEBUG 0  // 0 = silencioso; 1 = logs de depuración
+const int ROL_ADMIN = 1;
+const int ROL_NODO  = 0;
+const int ROL_ACTIVO = ROL_ADMIN;              // UNA placa como ADMIN; el resto NODO
+const char NOMBRE_DISPOSITIVO[] = "Nodo 0";    // Máx. 15 visibles (16 con '\0')
+const int  CANAL_WIFI = 6;
+
+const int  MAXIMO_NODOS = 10;
+const int  LONGITUD_MAXIMA_NOMBRE = 16;
+const char VERSION_MENSAJE = 1;
+
+const int  TIEMPO_REBOTE_MS       = 1000;   // “debounce” para ráfagas de reenvío
+const int  INTERVALO_KEEPALIVE_MS = 8000;   // reenvío de lista periódica
+const int  INTERVALO_HEARTBEAT_MS = 5000;   // cada 5s heartbeat
+const int  TIEMPO_PRUNEO_MS       = 60000;  // 60s sin ver => marcar caído
+const int  INTERVALO_IMPRESION_MS = 5000;   // cada 5s reimprimir tabla (solo ADMIN)
+
+/* LED de “vinculado” */
+const int LED_PIN = 13;  // LED azul en pin 13 (ajústalo si usas otro)
+
+/* =======================
+   Mensajes por ESP-NOW
+   ======================= */
+const char TIPO_LISTA = 'L';
+const char TIPO_HEART = 'H';
+
+struct HeaderMsg {
+  char version;   // = VERSION_MENSAJE
+  char tipo;      // 'L' o 'H'
+} __attribute__((packed));
+
+struct MensajeHeartbeat {
+  HeaderMsg h;                        // {version, 'H'}
+  char nombre[LONGITUD_MAXIMA_NOMBRE];
+  uint32_t millisEmisor;              // uptime del emisor
+  uint32_t seq;                       // contador monotónico del emisor
+} __attribute__((packed));
+
+struct MensajeRed {
+  HeaderMsg h;                        // {version, 'L'}
+  char cantidad;
+  char nombres[MAXIMO_NODOS][LONGITUD_MAXIMA_NOMBRE];
+} __attribute__((packed));
+
+/* =======================
+   Estado local
+   ======================= */
+char nodosConocidos[MAXIMO_NODOS][LONGITUD_MAXIMA_NOMBRE];
+int  totalNodosConocidos = 0;
+
+struct InfoNodo {
+  char nombre[LONGITUD_MAXIMA_NOMBRE];
+  uint32_t lastSeen;        // millis() última vez visto
+  uint32_t lastSeq;         // última secuencia HB vista
+  uint32_t remoteUptimeMs;  // último uptime remoto recibido
+  uint8_t  vivo;            // 1=activo, 0=caído
+};
+
+InfoNodo tabla[MAXIMO_NODOS];
+int totalTabla = 0;
+
+volatile int hayEnvioPendiente   = 1;
+volatile int hayInformacionNueva = 0;
+unsigned long ultimoEnvio = 0;
+
+uint32_t seqLocal = 0;
+
+const uint8_t DIRECCION_BROADCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+/* =======================
+   Utilidades
+   ======================= */
+#if ENABLE_DEBUG
+  #define DPRINTLN(x) Serial.println(x)
+  #define DPRINT(x)   Serial.print(x)
+#else
+  #define DPRINTLN(x)
+  #define DPRINT(x)
+#endif
+
+void normalizarNombre(const char *entrada, char *salida) {
+  if (!entrada) { salida[0]='\0'; return; }
+  int longitud = strlen(entrada);
+  int inicio = 0;
+  while (inicio < longitud && isspace((unsigned char)entrada[inicio])) inicio++;
+  int fin = longitud;
+  while (fin > inicio && isspace((unsigned char)entrada[fin-1])) fin--;
+  int n = (fin > inicio) ? (fin - inicio) : 0;
+  if (n > LONGITUD_MAXIMA_NOMBRE - 1) n = LONGITUD_MAXIMA_NOMBRE - 1;
+  memcpy(salida, entrada + inicio, n);
+  salida[n] = '\0';
+}
+
+int idxNodoPorNombre(const char* nom) {
+  for (int i=0; i<totalTabla; i++) {
+    if (strcmp(tabla[i].nombre, nom) == 0) return i;
+  }
+  return -1;
+}
+
+int tocarNodo(const char* nom, uint32_t ahora, uint32_t seq) {
+  int idx = idxNodoPorNombre(nom);
+  if (idx < 0) {
+    if (totalTabla >= MAXIMO_NODOS) return -1;
+    strncpy(tabla[totalTabla].nombre, nom, LONGITUD_MAXIMA_NOMBRE-1);
+    tabla[totalTabla].nombre[LONGITUD_MAXIMA_NOMBRE-1] = '\0';
+    tabla[totalTabla].lastSeen = ahora;
+    tabla[totalTabla].lastSeq  = seq;
+    tabla[totalTabla].remoteUptimeMs = 0;
+    tabla[totalTabla].vivo     = 1;
+    totalTabla++;
+    return totalTabla-1;
+  } else {
+    tabla[idx].lastSeen = ahora;
+    if (seq != 0) tabla[idx].lastSeq = seq;
+    tabla[idx].vivo = 1;
+    return idx;
+  }
+}
+
+int agregarNodoConocido(const char *nombre, int esLocal) {
+  char normalizado[LONGITUD_MAXIMA_NOMBRE];
+  normalizarNombre(nombre, normalizado);
+  if (normalizado[0] == '\0') return 0;
+
+  for (int i=0;i<totalNodosConocidos;i++) {
+    if (strcmp(nodosConocidos[i], normalizado) == 0) {
+      tocarNodo(normalizado, millis(), 0);
+      return 0;
+    }
+  }
+
+  if (totalNodosConocidos >= MAXIMO_NODOS) {
+    DPRINTLN(F("[ADVERTENCIA] Máximo de nodos alcanzado."));
+    return 0;
+  }
+
+  strcpy(nodosConocidos[totalNodosConocidos], normalizado);
+  totalNodosConocidos++;
+  tocarNodo(normalizado, millis(), 0);
+  return 1;
+}
+
+/* =======================
+   LED de vinculación
+   ======================= */
+void actualizarLedVinculo() {
+  bool hayParVivo = false;
+  for (int i=0; i<totalTabla; i++) {
+    if (tabla[i].vivo && strcmp(tabla[i].nombre, NOMBRE_DISPOSITIVO) != 0) {
+      hayParVivo = true;
+      break;
+    }
+  }
+  digitalWrite(LED_PIN, hayParVivo ? HIGH : LOW);
+}
+
+/* =======================
+   Impresión compacta (solo ADMIN)
+   ======================= */
+void imprimirTablaActivos() {
+  if (ROL_ACTIVO != ROL_ADMIN) return;
+  Serial.println(F("NODOS ACTIVOS | UPTIME(s)"));
+  for (int i=0;i<totalTabla;i++) {
+    if (tabla[i].vivo) {
+      Serial.print(tabla[i].nombre);
+      Serial.print(F(" | "));
+      float s = tabla[i].remoteUptimeMs > 0 ? (tabla[i].remoteUptimeMs / 1000.0f) : 0.0f;
+      Serial.println(s, 1);
+    }
+  }
+  Serial.println();
+}
+
+/* =======================
+   Envíos
+   ======================= */
+void difundirNodosConocidos() {
+  if (totalNodosConocidos == 0) return;
+
+  MensajeRed msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.h.version = VERSION_MENSAJE;
+  msg.h.tipo    = TIPO_LISTA;
+
+  int count = 0;
+  for (int i=0; i<totalNodosConocidos && count<MAXIMO_NODOS; i++) {
+    int idx = idxNodoPorNombre(nodosConocidos[i]);
+    if (idx >= 0 && tabla[idx].vivo == 1) {
+      strncpy(msg.nombres[count], nodosConocidos[i], LONGITUD_MAXIMA_NOMBRE-1);
+      count++;
+    }
+  }
+  msg.cantidad = (char)count;
+
+  int payload = sizeof(HeaderMsg) + 1 + (count * LONGITUD_MAXIMA_NOMBRE);
+  esp_now_send(DIRECCION_BROADCAST, (const uint8_t*)&msg, payload);
+}
+
+void enviarHeartbeat() {
+  MensajeHeartbeat hb;
+  memset(&hb, 0, sizeof(hb));
+  hb.h.version = VERSION_MENSAJE;
+  hb.h.tipo    = TIPO_HEART;
+  strncpy(hb.nombre, NOMBRE_DISPOSITIVO, LONGITUD_MAXIMA_NOMBRE-1);
+  hb.millisEmisor = millis();
+  hb.seq = ++seqLocal;
+
+  esp_now_send(DIRECCION_BROADCAST, (const uint8_t*)&hb, sizeof(hb));
+}
+
+/* =======================
+   Callbacks ESP-NOW (IDF 5.x)
+   ======================= */
+void cuandoSeEnvia(const wifi_tx_info_t*, esp_now_send_status_t estado) { (void)estado; }
+
+void cuandoSeRecibe(const esp_now_recv_info *info, const uint8_t *datos, int longitud) {
+  if (!info || longitud < (int)sizeof(HeaderMsg)) return;
+
+  HeaderMsg h; memcpy(&h, datos, sizeof(HeaderMsg));
+  if (h.version != VERSION_MENSAJE) return;
+
+  if (h.tipo == TIPO_LISTA) {
+    if (longitud < (int)(sizeof(HeaderMsg)+1)) return;
+
+    MensajeRed msg; memset(&msg, 0, sizeof(msg));
+    int bytesACopiar = min((int)sizeof(MensajeRed), longitud);
+    memcpy(&msg, datos, bytesACopiar);
+
+    int maxSegunTam = (longitud - (int)sizeof(HeaderMsg) - 1) / LONGITUD_MAXIMA_NOMBRE;
+    if (maxSegunTam < 0) maxSegunTam = 0;
+    if (msg.cantidad > maxSegunTam) msg.cantidad = (char)maxSegunTam;
+
+    int actualizo = 0;
+    for (int i=0;i<msg.cantidad;i++) {
+      if (msg.nombres[i][0] == '\0') continue;
+      if (agregarNodoConocido(msg.nombres[i], 0) == 1) actualizo = 1;
+      tocarNodo(msg.nombres[i], millis(), 0);
+    }
+    if (actualizo) { hayEnvioPendiente = 1; hayInformacionNueva = 1; }
+
+    actualizarLedVinculo();  // actualizar LED al recibir lista
+
+  } else if (h.tipo == TIPO_HEART) {
+    if (longitud < (int)sizeof(MensajeHeartbeat)) return;
+
+    MensajeHeartbeat hb; memcpy(&hb, datos, sizeof(MensajeHeartbeat));
+    agregarNodoConocido(hb.nombre, 0);
+    int idx = tocarNodo(hb.nombre, millis(), hb.seq);
+    if (idx >= 0) tabla[idx].remoteUptimeMs = hb.millisEmisor;
+
+    actualizarLedVinculo();  // actualizar LED al recibir HB
+  }
+}
+
+/* =======================
+   Setup / Loop
+   ======================= */
+void setup() {
+  Serial.begin(115200);
+  delay(150);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);  // por defecto apagado
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(CANAL_WIFI, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+  if (esp_now_init() != ESP_OK) { delay(1000); ESP.restart(); }
+
+  esp_now_register_send_cb(cuandoSeEnvia);
+  esp_now_register_recv_cb(cuandoSeRecibe);
+
+  // Peer broadcast (IDF 5.x: WIFI_IF_STA)
+  esp_now_peer_info_t peerBroadcast;
+  memset(&peerBroadcast, 0, sizeof(peerBroadcast));
+  memcpy(peerBroadcast.peer_addr, DIRECCION_BROADCAST, 6);
+  peerBroadcast.channel = CANAL_WIFI;
+  peerBroadcast.encrypt = false;
+  peerBroadcast.ifidx = WIFI_IF_STA;
+
+  if (esp_now_add_peer(&peerBroadcast) != ESP_OK) { delay(1000); ESP.restart(); }
+
+  agregarNodoConocido(NOMBRE_DISPOSITIVO, 1);
+
+  hayEnvioPendiente   = 1;
+  hayInformacionNueva = 1;
+
+  actualizarLedVinculo();  // inicial
+}
+
+void loop() {
+  unsigned long ahora = millis();
+
+  // 1) Heartbeat periódico
+  static unsigned long ultimoHB = 0;
+  if ((ahora - ultimoHB) >= (unsigned long)INTERVALO_HEARTBEAT_MS) {
+    enviarHeartbeat();
+    ultimoHB = ahora;
+  }
+
+  // 2) Prune periódico (marcar caídos)
+  static unsigned long ultimoPrune = 0;
+  if ((ahora - ultimoPrune) >= 2000UL) {
+    for (int i=0;i<totalTabla;i++) {
+      if (tabla[i].vivo && (ahora - tabla[i].lastSeen) >= (unsigned long)TIEMPO_PRUNEO_MS) {
+        tabla[i].vivo = 0;
+        hayEnvioPendiente = 1;
+        hayInformacionNueva = 1;
+      }
+    }
+    actualizarLedVinculo();  // si alguno cayó, reevaluar LED
+    ultimoPrune = ahora;
+  }
+
+  // 3) Difusión de lista (rebote / keepalive)
+  if (hayEnvioPendiente == 1 && (ahora - ultimoEnvio) >= (unsigned long)TIEMPO_REBOTE_MS) {
+    difundirNodosConocidos();
+    hayEnvioPendiente = 0;
+  } else if ((ahora - ultimoEnvio) >= (unsigned long)INTERVALO_KEEPALIVE_MS) {
+    difundirNodosConocidos();
+  }
+
+  // 4) Tabla compacta (solo ADMIN)
+  static unsigned long ultimoPrint = 0;
+  if (ROL_ACTIVO == ROL_ADMIN && (ahora - ultimoPrint) >= (unsigned long)INTERVALO_IMPRESION_MS) {
+    imprimirTablaActivos();
+    ultimoPrint = ahora;
+  }
+}
